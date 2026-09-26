@@ -7,9 +7,9 @@ rule being honoured first, those hard-won facts were lost forever.
 
 This plugin makes persistence automatic: its ``compress()`` runs *before* every
 compaction, snapshots the recent assistant turns (the inferences/learnings about
-to be compressed away) into the knowledge dictionary on F:, redacts any secrets,
-and commits the dictionary — then it delegates to the built-in ContextCompressor
-to actually shrink the context.
+to be compressed away) into the knowledge dictionary, redacts any secrets, and
+commits the dictionary — then it delegates to the built-in ContextCompressor to
+actually shrink the context.
 
 The Hermes plugin loader (``instance_from_module``) imports this package's
 ``__init__.py`` and pulls out the ``engine`` symbol, which must be a subclass of
@@ -29,25 +29,40 @@ from typing import Any, Dict, List
 from agent.context_engine import ContextEngine
 
 
-# Knowledge dictionary on F: (overridable via env, matching memory.py).
-# Paths are derived from __file__ so CPython (which does NOT do MSYS path
-# conversion on Windows) resolves them correctly regardless of how the
-# process was launched. memory.py itself anchors HERE to __file__.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-# Default store lives in the sibling "memory" project folder next to this plugin's
-# parent (hermes-agent/plugins/context_engine/<name>/ -> F:/hermes working directory/memory).
-# Overridable via env to match memory.py's MEMORY_DIR / MEMORY_STORE / MEMORY_INDEX.
-if os.environ.get("MEMORY_DIR"):
-    MEMORY_DIR = os.environ["MEMORY_DIR"]
-elif os.environ.get("MEMORY_STORE"):
-    MEMORY_DIR = os.path.dirname(os.environ["MEMORY_STORE"])
-else:
-    # The knowledge dictionary is the canonical project on F:
-    # F:/hermes working directory/memory
-    # NOTE: hermes-agent source lives on C:, so this is NOT reachable by
-    # walking up from __file__. CPython resolves the canonical F:/ path fine
-    # (no MSYS mangling) as long as we pass it as a literal, not an env var.
-    MEMORY_DIR = "F:/hermes working directory/memory"
+# Knowledge dictionary directory (overridable via env). Resolved at runtime.
+def _resolve_memory_dir() -> str:
+    """Return the knowledge-dictionary directory.
+
+    Resolution order (mirrors memory.py's env support):
+      1. Explicit ``MEMORY_DIR`` env var (preferred).
+      2. ``MEMORY_STORE`` env var -> its containing directory.
+      3. The sibling ``memory`` project next to ``HERMES_HOME``.
+    Fail closed when none resolve, so a misconfigured host cannot silently
+    create a relative knowledge-dictionary tree under the current working
+    directory on POSIX.
+    """
+    explicit = os.environ.get("MEMORY_DIR")
+    if explicit:
+        return explicit
+    store_env = os.environ.get("MEMORY_STORE")
+    if store_env:
+        return os.path.dirname(store_env)
+    try:
+        from hermes_constants import get_hermes_home
+        home = os.path.dirname(str(get_hermes_home()))
+        candidate = os.path.join(home, "memory")
+        if os.path.isdir(candidate):
+            return candidate
+    except Exception:
+        pass
+    raise RuntimeError(
+        "persist_before_compress: knowledge dictionary directory is not "
+        "configured. Set the MEMORY_DIR environment variable (e.g. to the "
+        "'memory' project)."
+    )
+
+
+MEMORY_DIR = _resolve_memory_dir()
 STORE = os.environ.get("MEMORY_STORE", os.path.join(MEMORY_DIR, "learnings.jsonl"))
 INDEX = os.environ.get("MEMORY_INDEX", os.path.join(MEMORY_DIR, "index.json"))
 
@@ -141,10 +156,20 @@ def _write_to_dictionary(snapshot: List[str], title: str, category: str, subcate
 
 
 def _commit_dictionary() -> None:
-    """git add -A && git commit the dictionary on F: so it survives."""
+    """git commit the dictionary so it survives.
+
+    Only the two owned dictionary files are staged (not ``git add -A``), so
+    committing here never sweeps in unrelated changes from the rest of the
+    repository.
+    """
     try:
+        staged = subprocess.run(
+            ["git", "-C", MEMORY_DIR, "diff", "--cached", "--quiet"],
+            capture_output=True, text=True, timeout=30,
+        )
         subprocess.run(
-            ["git", "-C", MEMORY_DIR, "add", "-A"],
+            ["git", "-C", MEMORY_DIR, "add",
+             os.path.basename(STORE), os.path.basename(INDEX)],
             capture_output=True, text=True, timeout=30,
         )
         # Only commit if there is something staged (avoid empty commits).
@@ -152,7 +177,7 @@ def _commit_dictionary() -> None:
             ["git", "-C", MEMORY_DIR, "diff", "--cached", "--quiet"],
             capture_output=True, text=True, timeout=30,
         )
-        if res.returncode != 0:  # non-zero => changes staged
+        if res.returncode != 0:
             subprocess.run(
                 ["git", "-C", MEMORY_DIR, "commit", "-m",
                  "persist_before_compress: pre-compaction inferences snapshot"],
@@ -172,7 +197,6 @@ class PersistBeforeCompressEngine(ContextEngine):
                  abort_on_summary_failure: bool = False, max_tokens: int | None = None,
                  model_thresholds: dict | None = None, threshold_tokens_cap: Any = None,
                  proactive_prune_tokens: int = 0, **_: Any):
-        # Build the real compressor and configure it exactly like the host would.
         from agent.context_compressor import ContextCompressor
         self._compressor = ContextCompressor(
             model=model, threshold_percent=threshold_percent, protect_first_n=protect_first_n,
@@ -208,7 +232,7 @@ class PersistBeforeCompressEngine(ContextEngine):
 
         Before the middle turns (which hold the assistant's recent inferences/
         learnings) are compressed away, snapshot them to the knowledge dictionary
-        on F: and commit. This fires on EVERY compaction — no willpower required.
+        and commit. This fires on EVERY compaction — no willpower required.
         """
         try:
             snapshot = _snapshot_messages(messages)
@@ -226,7 +250,7 @@ class PersistBeforeCompressEngine(ContextEngine):
         except Exception:
             # Persistence is best-effort: never let it break the actual compression.
             pass
-        # Delegate to the built-in compressor to actually shrink the context.
+        # Delegate to the built-in compressor to shrink the context.
         return self._compressor.compress(
             messages, current_tokens=current_tokens, focus_topic=focus_topic, force=force,
             memory_context=memory_context,
